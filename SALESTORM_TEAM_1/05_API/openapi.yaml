@@ -1,0 +1,729 @@
+openapi: 3.0.3
+info:
+  title: SALESTORM Flash-Sale E-Commerce Platform API
+  version: 1.0.0
+  description: |
+    **SALESTORM | SYSCRAFTERS 2026 — Team 1**
+    REST API specification for high-concurrency flash-sale discovery, cart management,
+    atomic inventory reservation (`RedisLuaStockGate` + PostgreSQL conditional update),
+    checkout quote orchestration, idempotent payment settlement, and resilient order tracking.
+  contact:
+    name: SALESTORM Team 1 System Architects
+
+servers:
+  - url: https://api.salestorm.io/api/v1
+    description: Production Edge API Gateway (Cloudflare + AWS ALB)
+  - url: http://localhost:8000/api/v1
+    description: Local Simulation & Verification Server
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Discovery
+    description: Product catalog, categories, and active flash-sale deals (CDN/Redis cached)
+  - name: Cart
+    description: Shopping cart and coupon pricing management
+  - name: Reservation
+    description: High-concurrency atomic stock reservation and TTL management
+  - name: Checkout
+    description: Checkout orchestration and pricing/coupon lock
+  - name: Payment
+    description: Idempotent payment capture, reconciliation, and outbox settlement
+  - name: Order
+    description: Order lifecycle state machine, shipment tracking, and cancellation
+
+paths:
+  /products:
+    get:
+      tags: [Discovery]
+      summary: List products and active flash-sale deals
+      operationId: listProducts
+      security: []
+      parameters:
+        - name: category_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: flash_sale_only
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Cached product catalog list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProductSummary'
+
+  /products/{product_id}/inventory:
+    get:
+      tags: [Discovery]
+      summary: Get real-time flash-sale stock availability for a product
+      operationId: getProductInventory
+      security: []
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: PRODUCT_X
+      responses:
+        '200':
+          description: Current stock snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventorySnapshot'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /cart/items:
+    post:
+      tags: [Cart]
+      summary: Add item to customer cart and calculate flash/coupon pricing
+      operationId: addCartItem
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CartItemRequest'
+      responses:
+        '200':
+          description: Updated cart with pricing breakdown
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CartResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /reservations:
+    post:
+      tags: [Reservation]
+      summary: Atomically reserve flash-sale inventory (Fast-Path Lua Gate + ACID DB Hold)
+      description: |
+        Requires a mandatory `Idempotency-Key` header.
+        - **201 Created:** New reservation created (`available_quantity` decremented by 1).
+        - **200 OK:** Idempotent replay for an active `Idempotency-Key` (zero additional stock deducted).
+        - **409 Conflict (`SOLD_OUT`):** Fast-path Redis gate or PostgreSQL conditional update rejected due to zero available stock.
+        - **410 Gone:** Replayed `Idempotency-Key` belongs to an expired/released reservation.
+      operationId: createReservation
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReservationRequest'
+      responses:
+        '201':
+          description: Inventory successfully reserved with TTL (default 10 minutes)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationResponse'
+        '200':
+          description: Idempotent replay of existing active reservation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '409':
+          $ref: '#/components/responses/SoldOutConflictError'
+        '410':
+          description: Reservation associated with Idempotency-Key has already expired or been released
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
+        '429':
+          $ref: '#/components/responses/RateLimitExceededError'
+
+  /reservations/{reservation_id}:
+    get:
+      tags: [Reservation]
+      summary: Get current reservation status and remaining TTL
+      operationId: getReservation
+      parameters:
+        - name: reservation_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Reservation details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationResponse'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /checkout:
+    post:
+      tags: [Checkout]
+      summary: Bind active reservation, apply pricing/coupon strategy, and generate checkout quote
+      operationId: createCheckoutQuote
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutRequest'
+      responses:
+        '200':
+          description: Locked checkout pricing quote ready for payment
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutQuoteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '410':
+          description: Reservation expired prior to checkout
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
+
+  /payments:
+    post:
+      tags: [Payment]
+      summary: Execute idempotent payment for an active reservation
+      description: |
+        Requires a mandatory `Idempotency-Key` header.
+        1. Locks reservation in `PAYMENT_PENDING` (extends grace window by 60s).
+        2. Charges external payment gateway via `CircuitBreakerProxy`.
+        3. On `SUCCESS`: Atomically commits `payment ('SUCCESS')`, `inventory_reservation ('CONFIRMED' -> 'SOLD')`, `inventory ('SOLD')`, and `outbox_event ('OrderRequested')` in one local transaction.
+        4. On `FAILED`: Atomically releases reservation (`PAYMENT_FAILED` -> `RELEASED`) and restores `available_quantity + 1` in PostgreSQL and Redis.
+        5. On `TIMEOUT`: Sets `TIMEOUT_UNKNOWN` (`202 Accepted`) for background reconciliation.
+      operationId: processPayment
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+      responses:
+        '200':
+          description: Payment succeeded (or idempotent replay of prior payment)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '202':
+          description: Payment gateway timed out; active reconciliation in progress (`TIMEOUT_UNKNOWN`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '402':
+          description: Payment declined by external gateway; reserved stock has been released
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
+              example:
+                error_code: PAYMENT_DECLINED
+                message: Card declined by issuer (INSUFFICIENT_FUNDS). Reserved stock released.
+                trace_id: trc-99812a
+                timestamp: '2026-10-12T09:15:00Z'
+        '409':
+          description: Reservation is already paid or currently processing another payment request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
+        '410':
+          description: Reservation TTL expired prior to payment initiation (`RELEASED`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
+        '503':
+          $ref: '#/components/responses/CircuitBreakerOpenError'
+
+  /orders/{order_id}:
+    get:
+      tags: [Order]
+      summary: Get order details, lifecycle state, and shipment tracking
+      operationId: getOrder
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Order state and shipment details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /orders/{order_id}/transitions:
+    patch:
+      tags: [Order]
+      summary: Advance order state (enforced by OrderStateMachine)
+      operationId: transitionOrderState
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_status]
+              properties:
+                target_status:
+                  $ref: '#/components/schemas/OrderStatus'
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: State transition applied successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '422':
+          description: Illegal state transition rejected by OrderStateMachine
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
+              example:
+                error_code: INVALID_STATE_TRANSITION
+                message: Cannot transition order from CREATED directly to DELIVERED.
+                trace_id: trc-77123b
+                timestamp: '2026-10-12T09:16:00Z'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUIDv4 guaranteeing at-most-once execution across network retries.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        example: idem-cust101-e89b-12d3-a456-426614174000
+
+  schemas:
+    ReservationStatus:
+      type: string
+      enum:
+        - AVAILABLE
+        - RESERVED
+        - PAYMENT_PENDING
+        - CONFIRMED
+        - SOLD
+        - PAYMENT_FAILED
+        - TIMEOUT
+        - RELEASED
+
+    PaymentStatus:
+      type: string
+      enum:
+        - INITIATED
+        - PENDING
+        - SUCCESS
+        - FAILED
+        - TIMEOUT_UNKNOWN
+        - RECONCILED_SUCCESS
+        - RECONCILED_FAILED
+        - REFUNDED
+
+    OrderStatus:
+      type: string
+      enum:
+        - CREATED
+        - PAYMENT_PENDING
+        - CONFIRMED
+        - PROCESSING
+        - SHIPPED
+        - OUT_FOR_DELIVERY
+        - DELIVERED
+        - CANCELLED
+        - REFUND_PENDING
+        - REFUNDED
+
+    ProductSummary:
+      type: object
+      required: [product_id, sku, name, base_price, sale_price, is_flash_sale]
+      properties:
+        product_id:
+          type: string
+          example: PRODUCT_X
+        sku:
+          type: string
+          example: SKU-FLASH-X100
+        name:
+          type: string
+          example: SaleStorm Flagship Edition X
+        base_price:
+          type: number
+          format: double
+          example: 999.00
+        sale_price:
+          type: number
+          format: double
+          example: 499.00
+        is_flash_sale:
+          type: boolean
+          example: true
+
+    InventorySnapshot:
+      type: object
+      required: [product_id, total_stock, available_quantity, reserved_quantity, sold_quantity, version]
+      properties:
+        product_id:
+          type: string
+          example: PRODUCT_X
+        total_stock:
+          type: integer
+          example: 100
+        available_quantity:
+          type: integer
+          minimum: 0
+          example: 42
+        reserved_quantity:
+          type: integer
+          minimum: 0
+          example: 8
+        sold_quantity:
+          type: integer
+          minimum: 0
+          example: 50
+        version:
+          type: integer
+          format: int64
+          example: 108
+
+    CartItemRequest:
+      type: object
+      required: [product_id, quantity]
+      properties:
+        product_id:
+          type: string
+          example: PRODUCT_X
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 1
+          example: 1
+        coupon_code:
+          type: string
+          example: FLASH50
+
+    CartResponse:
+      type: object
+      required: [cart_id, customer_id, subtotal_amount, discount_amount, total_amount]
+      properties:
+        cart_id:
+          type: string
+          format: uuid
+        customer_id:
+          type: string
+          example: cust_00101
+        subtotal_amount:
+          type: number
+          example: 499.00
+        discount_amount:
+          type: number
+          example: 50.00
+        total_amount:
+          type: number
+          example: 449.00
+
+    CheckoutRequest:
+      type: object
+      required: [reservation_id, customer_id]
+      properties:
+        reservation_id:
+          type: string
+          format: uuid
+        customer_id:
+          type: string
+          example: cust_00101
+        coupon_code:
+          type: string
+          nullable: true
+          example: FLASH50
+
+    CheckoutQuoteResponse:
+      type: object
+      required: [reservation_id, customer_id, subtotal_amount, discount_amount, tax_amount, payable_amount, expires_at]
+      properties:
+        reservation_id:
+          type: string
+          format: uuid
+        customer_id:
+          type: string
+          example: cust_00101
+        subtotal_amount:
+          type: number
+          example: 499.00
+        discount_amount:
+          type: number
+          example: 0.00
+        tax_amount:
+          type: number
+          example: 0.00
+        payable_amount:
+          type: number
+          example: 499.00
+        expires_at:
+          type: string
+          format: date-time
+
+    ReservationRequest:
+      type: object
+      required: [product_id, customer_id, quantity]
+      properties:
+        product_id:
+          type: string
+          example: PRODUCT_X
+        customer_id:
+          type: string
+          example: cust_00101
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 1
+          default: 1
+
+    ReservationResponse:
+      type: object
+      required: [reservation_id, product_id, customer_id, quantity, status, idempotency_key, expires_at, idempotent_replay]
+      properties:
+        reservation_id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          example: PRODUCT_X
+        customer_id:
+          type: string
+          example: cust_00101
+        quantity:
+          type: integer
+          example: 1
+        status:
+          $ref: '#/components/schemas/ReservationStatus'
+        idempotency_key:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        idempotent_replay:
+          type: boolean
+          example: false
+
+    PaymentRequest:
+      type: object
+      required: [reservation_id, customer_id, payment_token, payment_provider]
+      properties:
+        reservation_id:
+          type: string
+          format: uuid
+        customer_id:
+          type: string
+          example: cust_00101
+        payment_token:
+          type: string
+          description: Gateway-tokenized payment instrument (PCI-DSS safe; never raw card PAN)
+          example: pm_tok_visa_4242
+        payment_provider:
+          type: string
+          enum: [STRIPE, RAZORPAY]
+          default: STRIPE
+
+    PaymentResponse:
+      type: object
+      required: [payment_id, reservation_id, payment_status, reservation_status, order_status, transaction_reference, idempotent_replay]
+      properties:
+        payment_id:
+          type: string
+          format: uuid
+        reservation_id:
+          type: string
+          format: uuid
+        payment_status:
+          $ref: '#/components/schemas/PaymentStatus'
+        reservation_status:
+          $ref: '#/components/schemas/ReservationStatus'
+        order_status:
+          type: string
+          description: CONFIRMED if order is already created, or CONFIRMING if buffered in Transactional Outbox
+          example: CONFIRMING
+        order_id:
+          type: string
+          format: uuid
+          nullable: true
+        transaction_reference:
+          type: string
+          example: tx_ref_8f14e45f
+        provider_tx_id:
+          type: string
+          nullable: true
+          example: ch_3Pq99123
+        idempotent_replay:
+          type: boolean
+          example: false
+
+    OrderResponse:
+      type: object
+      required: [order_id, reservation_id, payment_id, customer_id, status, total_amount, created_at]
+      properties:
+        order_id:
+          type: string
+          format: uuid
+        reservation_id:
+          type: string
+          format: uuid
+        payment_id:
+          type: string
+          format: uuid
+        customer_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        total_amount:
+          type: number
+          example: 499.00
+        shipment:
+          type: object
+          nullable: true
+          properties:
+            carrier_name:
+              type: string
+              example: DELHIVERY
+            tracking_number:
+              type: string
+              example: DLV9988776655
+            status:
+              type: string
+              example: IN_TRANSIT
+        created_at:
+          type: string
+          format: date-time
+
+    ErrorModel:
+      type: object
+      required: [error_code, message, trace_id, timestamp]
+      properties:
+        error_code:
+          type: string
+          example: SOLD_OUT
+        message:
+          type: string
+          example: All 100 units of PRODUCT_X are currently reserved or sold.
+        trace_id:
+          type: string
+          example: trc-4bf92f3577b34da6
+        timestamp:
+          type: string
+          format: date-time
+
+  responses:
+    BadRequestError:
+      description: Missing Idempotency-Key header or malformed request payload
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'
+          example:
+            error_code: MISSING_IDEMPOTENCY_KEY
+            message: Header 'Idempotency-Key' is mandatory for state-mutating operations.
+            trace_id: trc-001122
+            timestamp: '2026-10-12T09:15:00Z'
+
+    UnauthorizedError:
+      description: Missing or invalid JWT Bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'
+
+    NotFoundError:
+      description: Requested resource was not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'
+
+    SoldOutConflictError:
+      description: Product stock depleted (`available_quantity == 0`)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'
+          example:
+            error_code: SOLD_OUT
+            message: Product PRODUCT_X is out of stock.
+            trace_id: trc-445566
+            timestamp: '2026-10-12T09:15:01Z'
+
+    RateLimitExceededError:
+      description: Per-user rate limit exceeded or queued in Virtual Waiting Room
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'
+
+    CircuitBreakerOpenError:
+      description: Downstream provider circuit breaker is OPEN; failing fast to protect system stability
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'

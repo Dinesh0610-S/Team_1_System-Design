@@ -1,0 +1,324 @@
+@startuml SALESTORM_Class_Diagram
+skinparam classAttributeIconSize 0
+skinparam monochrome false
+skinparam packageStyle rectangle
+skinparam shadowing false
+
+title SALESTORM — Low-Level Design Class Diagram (Complete Domain Model)
+
+package "API, Orchestration Facade & Pricing Strategy" {
+    class CheckoutFacade {
+        - reservationOrchestrator: ReservationOrchestrator
+        - paymentOrchestrator: PaymentSagaOrchestrator
+        - pricingStrategy: IPricingStrategy
+        + reserveItem(cmd: ReserveCommand, idempotencyKey: String): ReservationDTO
+        + executeCheckout(cmd: CheckoutCommand, idempotencyKey: String): CheckoutQuoteDTO
+        + executePayment(cmd: PayCommand, idempotencyKey: String): PaymentReceiptDTO
+    }
+
+    interface IPricingStrategy {
+        + calculatePrice(basePrice: BigDecimal, deal: SaleDeal, coupon: Coupon, customer: Customer): BigDecimal
+    }
+
+    class FlashDealPricingStrategy implements IPricingStrategy
+    class CouponPricingStrategy implements IPricingStrategy
+    class LoyaltyTierPricingStrategy implements IPricingStrategy
+
+    class GlobalExceptionHandler {
+        + handleSoldOut(ex: SoldOutException): ErrorResponse
+        + handleExpired(ex: ReservationExpiredException): ErrorResponse
+        + handleInvalidTransition(ex: InvalidStateTransitionError): ErrorResponse
+        + handleCircuitOpen(ex: CircuitBreakerOpenException): ErrorResponse
+    }
+}
+
+package "Inventory & Reservation Domain" {
+    class Inventory {
+        + productId: String
+        + totalStock: int
+        + availableQuantity: int
+        + reservedQuantity: int
+        + soldQuantity: int
+        + version: long
+        + updatedAt: Instant
+        + validateConservationInvariant(): boolean
+    }
+
+    enum ReservationStatus {
+        AVAILABLE
+        RESERVED
+        PAYMENT_PENDING
+        CONFIRMED
+        SOLD
+        PAYMENT_FAILED
+        TIMEOUT
+        RELEASED
+    }
+
+    class InventoryReservation {
+        + reservationId: UUID
+        + productId: String
+        + customerId: String
+        + quantity: int
+        + status: ReservationStatus
+        + releaseReason: String
+        + idempotencyKey: String
+        + expiresAt: Instant
+        + createdAt: Instant
+        + isExpired(now: Instant): boolean
+        + markPaymentPending(graceSeconds: int): void
+        + markConfirmedAndSold(): void
+        + markReleased(reason: String): void
+    }
+
+    interface IStockGate {
+        + tryReserve(productId: String, qty: int, idemKey: String, resId: UUID): GateResult
+        + releaseStock(productId: String, qty: int, resId: UUID, idemKey: String): boolean
+        + seedFromDatabase(productId: String, availableQty: int): void
+    }
+
+    class RedisLuaStockGate implements IStockGate {
+        - redisClient: RedisClusterClient
+        - reserveLuaSha: String
+        - releaseLuaSha: String
+        + tryReserve(productId: String, qty: int, idemKey: String, resId: UUID): GateResult
+        + releaseStock(productId: String, qty: int, resId: UUID, idemKey: String): boolean
+        + seedFromDatabase(productId: String, availableQty: int): void
+    }
+
+    interface IInventoryRepository {
+        + decrementAvailableAtomic(productId: String, qty: int): boolean
+        + confirmSoldAtomic(productId: String, qty: int): boolean
+        + restoreAvailableAtomic(productId: String, qty: int): boolean
+        + findByProductId(productId: String): Inventory
+    }
+
+    class PostgresInventoryRepository implements IInventoryRepository {
+        - dataSource: DataSource
+        + decrementAvailableAtomic(productId: String, qty: int): boolean
+        + confirmSoldAtomic(productId: String, qty: int): boolean
+        + restoreAvailableAtomic(productId: String, qty: int): boolean
+        + findByProductId(productId: String): Inventory
+    }
+
+    class PessimisticInventoryRepository implements IInventoryRepository {
+        - dataSource: DataSource
+        + decrementAvailableAtomic(productId: String, qty: int): boolean
+        + confirmSoldAtomic(productId: String, qty: int): boolean
+        + restoreAvailableAtomic(productId: String, qty: int): boolean
+        + findByProductId(productId: String): Inventory
+    }
+
+    interface IReservationRepository {
+        + findByIdempotencyKey(idemKey: String): Optional<InventoryReservation>
+        + findById(reservationId: UUID): Optional<InventoryReservation>
+        + insert(reservation: InventoryReservation): void
+        + updateStatusConditional(resId: UUID, expected: ReservationStatus, next: ReservationStatus): boolean
+        + reclaimExpiredReservedBatch(limit: int): List<InventoryReservation>
+    }
+
+    class ReservationOrchestrator {
+        - stockGate: IStockGate
+        - inventoryRepo: IInventoryRepository
+        - reservationRepo: IReservationRepository
+        + reserve(cmd: ReserveCommand, idemKey: String): InventoryReservation
+    }
+
+    class ExpirySweeperWorker {
+        - reservationRepo: IReservationRepository
+        - inventoryRepo: IInventoryRepository
+        - stockGate: IStockGate
+        + processExpiredBatch(): int
+    }
+}
+
+package "Payment, Resilience & Outbox Domain" {
+    enum PaymentStatus {
+        INITIATED
+        PENDING
+        SUCCESS
+        FAILED
+        TIMEOUT_UNKNOWN
+        RECONCILED_SUCCESS
+        RECONCILED_FAILED
+        REFUNDED
+    }
+
+    class Payment {
+        + paymentId: UUID
+        + reservationId: UUID
+        + customerId: String
+        + amount: BigDecimal
+        + status: PaymentStatus
+        + idempotencyKey: String
+        + transactionReference: String
+        + providerTxId: String
+        + failureReason: String
+    }
+
+    class OutboxEvent {
+        + eventId: UUID
+        + aggregateType: String
+        + aggregateId: String
+        + eventType: String
+        + payloadJson: String
+        + status: OutboxStatus
+        + retryCount: int
+        + nextRetryAt: Instant
+        + lastError: String
+        + processedAt: Instant
+    }
+
+    interface IPaymentGatewayAdapter {
+        + charge(req: GatewayChargeRequest): GatewayChargeResponse
+        + refund(providerTxId: String, amount: BigDecimal): GatewayRefundResponse
+        + getChargeStatus(transactionReference: String): GatewayStatusResponse
+    }
+
+    class StripePaymentAdapter implements IPaymentGatewayAdapter
+    class RazorpayPaymentAdapter implements IPaymentGatewayAdapter
+
+    class PaymentGatewayFactory {
+        + getAdapter(provider: String): IPaymentGatewayAdapter
+    }
+
+    class CircuitBreakerProxy {
+        - state: CircuitState
+        - failureCount: int
+        - failureThreshold: int
+        - recoveryTimeout: Duration
+        + execute(action: Supplier<T>): T
+        + recordSuccess(): void
+        + recordFailure(): void
+    }
+
+    class PaymentSagaOrchestrator {
+        - paymentRepo: IPaymentRepository
+        - reservationRepo: IReservationRepository
+        - inventoryRepo: IInventoryRepository
+        - outboxRepo: IOutboxRepository
+        - stockGate: IStockGate
+        - circuitBreaker: CircuitBreakerProxy
+        - gatewayFactory: PaymentGatewayFactory
+        + processPayment(cmd: PayCommand, idemKey: String): Payment
+    }
+
+    class PaymentReconciliationWorker {
+        - paymentRepo: IPaymentRepository
+        - paymentOrchestrator: PaymentSagaOrchestrator
+        + reconcileUnknownTimeouts(): int
+    }
+
+    class OutboxPublisherWorker {
+        - outboxRepo: IOutboxRepository
+        - orderCircuitBreaker: CircuitBreakerProxy
+        - orderService: OrderService
+        + drainPendingEvents(): int
+    }
+}
+
+package "Order, Fulfilment, Shipment & Notification Domain" {
+    enum OrderStatus {
+        CREATED
+        PAYMENT_PENDING
+        CONFIRMED
+        PROCESSING
+        SHIPPED
+        OUT_FOR_DELIVERY
+        DELIVERED
+        CANCELLED
+        REFUND_PENDING
+        REFUNDED
+    }
+
+    interface IOrderState {
+        + getStatus(): OrderStatus
+        + canTransitionTo(target: OrderStatus): boolean
+        + transition(order: Order, target: OrderStatus): IOrderState
+    }
+
+    class CreatedOrderState implements IOrderState
+    class PaymentPendingOrderState implements IOrderState
+    class ConfirmedOrderState implements IOrderState
+    class ProcessingOrderState implements IOrderState
+    class ShippedOrderState implements IOrderState
+    class OutForDeliveryOrderState implements IOrderState
+    class DeliveredOrderState implements IOrderState
+    class CancelledOrderState implements IOrderState
+    class RefundPendingOrderState implements IOrderState
+    class RefundedOrderState implements IOrderState
+
+    class Order {
+        + orderId: UUID
+        + reservationId: UUID
+        + paymentId: UUID
+        + customerId: String
+        + totalAmount: BigDecimal
+        + status: OrderStatus
+        - currentState: IOrderState
+        + transitionTo(target: OrderStatus): void
+    }
+
+    interface IDomainEventObserver {
+        + onEvent(event: DomainEvent): void
+    }
+
+    class FulfilmentService implements IDomainEventObserver {
+        + onEvent(event: DomainEvent): void
+        + allocateWarehouseBin(orderId: UUID): void
+    }
+
+    interface IShippingPartnerAdapter {
+        + bookShipment(orderId: UUID, addressJson: String): ShipmentBookingResult
+    }
+
+    class DelhiveryShippingAdapter implements IShippingPartnerAdapter
+    class FedExShippingAdapter implements IShippingPartnerAdapter
+
+    class ShipmentService {
+        - shippingAdapter: IShippingPartnerAdapter
+        + dispatchOrder(orderId: UUID): void
+    }
+
+    class NotificationService implements IDomainEventObserver {
+        + onEvent(event: DomainEvent): void
+    }
+
+    class AuditLogSubscriber implements IDomainEventObserver {
+        + onEvent(event: DomainEvent): void
+    }
+
+    class OrderService {
+        - orderRepo: IOrderRepository
+        - observers: List<IDomainEventObserver>
+        + createOrderFromOutbox(event: OutboxEvent): Order
+        + advanceOrderState(orderId: UUID, targetStatus: OrderStatus): Order
+    }
+}
+
+CheckoutFacade --> ReservationOrchestrator
+CheckoutFacade --> PaymentSagaOrchestrator
+CheckoutFacade --> IPricingStrategy
+ReservationOrchestrator --> IStockGate
+ReservationOrchestrator --> IInventoryRepository
+ReservationOrchestrator --> IReservationRepository
+ReservationOrchestrator --> InventoryReservation
+ExpirySweeperWorker --> IReservationRepository
+ExpirySweeperWorker --> IInventoryRepository
+ExpirySweeperWorker --> IStockGate
+
+PaymentSagaOrchestrator --> CircuitBreakerProxy
+PaymentSagaOrchestrator --> PaymentGatewayFactory
+PaymentGatewayFactory --> IPaymentGatewayAdapter
+PaymentSagaOrchestrator --> Payment
+PaymentSagaOrchestrator --> OutboxEvent
+PaymentReconciliationWorker --> PaymentSagaOrchestrator
+
+OutboxPublisherWorker --> CircuitBreakerProxy
+OutboxPublisherWorker --> OrderService
+OrderService --> Order
+Order *-- IOrderState
+OrderService --> IDomainEventObserver
+ShipmentService --> IShippingPartnerAdapter
+
+@enduml
